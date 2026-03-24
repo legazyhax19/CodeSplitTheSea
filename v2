@@ -1,0 +1,637 @@
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local Players           = game:GetService("Players")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+
+local CURRENT_PLOT      = nil
+local CURRENT_ISLAND    = nil
+local TELEPORT_DELAY    = 0.08
+local AUTO_FARMING      = false
+local AUTO_LOOP_RUNNING = false
+local SPLIT_WAIT_TIME   = 10
+local MAX_SPLIT_RETRIES = 3
+
+local ISLANDS = {"Basic", "VoidReef", "CyberTech", "RainbowReef", "RadioactiveReef"}
+local PLOTS   = {"Plot1", "Plot2", "Plot3", "Plot4", "Plot5"}
+
+local CARRY_CURRENT = 0
+local CARRY_MAX     = 0
+
+local RARITY_FILTER = {
+	Common    = true,
+	UnCommon  = true,
+	Rare      = true,
+	Legendary = true,
+	Mythic    = true,
+	Secret    = true,
+}
+local RARITY_ORDER    = {"Common","UnCommon","Rare","Legendary","Mythic","Secret"}
+local RARITY_PRIORITY = {"Secret","Mythic","Legendary","Rare","UnCommon","Common"}
+
+local BINDS = {
+	Collect  = Enum.KeyCode.G,
+	Home     = Enum.KeyCode.F,
+	Split    = Enum.KeyCode.H,
+	AutoFarm = Enum.KeyCode.J,
+	SellAll  = Enum.KeyCode.K,
+}
+
+local lootFolder     = workspace:WaitForChild("ActiveLoot")
+local busy           = false
+
+task.spawn(function()
+    local remote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CarryUpdate")
+    remote.OnClientEvent:Connect(function(data)
+        if type(data) == "table" then
+            CARRY_CURRENT = tonumber(data.Current) or 0
+            CARRY_MAX     = tonumber(data.Max) or 0
+        end
+    end)
+end)
+
+local function isCarryFull()
+    if CARRY_MAX <= 0 then return false end
+    return CARRY_CURRENT >= CARRY_MAX
+end
+
+local function freeSlots()
+    if CARRY_MAX <= 0 then return math.huge end
+    return math.max(0, CARRY_MAX - CARRY_CURRENT)
+end
+
+local function isAllFilterOn()
+	for _, r in ipairs(RARITY_ORDER) do
+		if not RARITY_FILTER[r] then return false end
+	end
+	return true
+end
+
+local function freezeCharacter()
+	local ch = player.Character
+	if not ch then return end
+	local hrp = ch:FindFirstChild("HumanoidRootPart")
+	local hum = ch:FindFirstChild("Humanoid")
+	if hrp then
+		hrp.Velocity                = Vector3.new(0,0,0)
+		hrp.AssemblyLinearVelocity  = Vector3.new(0,0,0)
+		hrp.AssemblyAngularVelocity = Vector3.new(0,0,0)
+	end
+	if hum then hum:ChangeState(Enum.HumanoidStateType.Running) end
+end
+
+local function safeTp(cf)
+	local ch = player.Character
+	if not ch then return false end
+	local hrp = ch:FindFirstChild("HumanoidRootPart")
+	if not hrp then return false end
+	hrp.Velocity                = Vector3.new(0,0,0)
+	hrp.AssemblyLinearVelocity  = Vector3.new(0,0,0)
+	hrp.AssemblyAngularVelocity = Vector3.new(0,0,0)
+	hrp.CFrame = cf
+	task.wait()
+	hrp.Velocity                = Vector3.new(0,0,0)
+	hrp.AssemblyLinearVelocity  = Vector3.new(0,0,0)
+	hrp.AssemblyAngularVelocity = Vector3.new(0,0,0)
+	local hum = ch:FindFirstChild("Humanoid")
+	if hum then hum:ChangeState(Enum.HumanoidStateType.Running) end
+	return true
+end
+
+local function waitChar()
+	local c = player.Character or player.CharacterAdded:Wait()
+	c:WaitForChild("HumanoidRootPart")
+	c:WaitForChild("Humanoid")
+	return c
+end
+
+local function hasHeldItem()
+	local ch = player.Character
+	if not ch then return false end
+	if ch:FindFirstChild("HeldItem") then return true end
+	local bs = ch:FindFirstChild("BackStick")
+	if bs then
+		local cube = bs:FindFirstChild("Cube.004")
+		if cube and cube:IsA("BasePart") and cube.Transparency >= 0.99 then return true end
+	end
+	return false
+end
+
+local function detectPlayerPlot()
+	local islands = workspace:FindFirstChild("Islands")
+	if not islands then return end
+	for _, islandName in ipairs(ISLANDS) do
+		local island = islands:FindFirstChild(islandName)
+		if not island then continue end
+		local plots = island:FindFirstChild("Plots")
+		if not plots then continue end
+		for _, plot in ipairs(plots:GetChildren()) do
+			local ownerId = plot:GetAttribute("OwnerUserId")
+			if ownerId and ownerId == player.UserId then
+				CURRENT_ISLAND = islandName
+				CURRENT_PLOT   = plot.Name
+				return
+			end
+		end
+	end
+	if not CURRENT_ISLAND then CURRENT_ISLAND = "Basic" end
+	if not CURRENT_PLOT   then CURRENT_PLOT   = "Plot1" end
+end
+
+detectPlayerPlot()
+
+local function getSafeZone()
+	local isl = workspace:FindFirstChild("Islands")
+	if not isl then return nil end
+	isl = isl:FindFirstChild(CURRENT_ISLAND)
+	if not isl then return nil end
+	local p = isl:FindFirstChild("Plots")
+	if not p then return nil end
+	p = p:FindFirstChild(CURRENT_PLOT)
+	if not p then return nil end
+	local imp = p:FindFirstChild("Important")
+	if not imp then return nil end
+	return imp:FindFirstChild("SafeZone")
+end
+
+local function getSplitZone()
+	local isl = workspace:FindFirstChild("Islands")
+	if not isl then return nil end
+	isl = isl:FindFirstChild(CURRENT_ISLAND)
+	if not isl then return nil end
+	local p = isl:FindFirstChild("Plots")
+	if not p then return nil end
+	p = p:FindFirstChild(CURRENT_PLOT)
+	if not p then return nil end
+	local imp = p:FindFirstChild("Important")
+	if not imp then return nil end
+	return imp:FindFirstChild("SplitZone")
+end
+
+local function buildCollectList()
+	local ch  = player.Character
+	if not ch then return {} end
+	local hrp = ch:FindFirstChild("HumanoidRootPart")
+	if not hrp then return {} end
+
+	local raw = {}
+	for _, m in ipairs(lootFolder:GetChildren()) do
+		if m:IsA("Model") and m:GetAttribute("PlotName") == CURRENT_PLOT then
+			local ok, pv = pcall(function() return m:GetPivot() end)
+			if ok and (pv.Position - hrp.Position).Magnitude <= 800 then
+				table.insert(raw, m)
+			end
+		end
+	end
+
+	local list = {}
+
+	if isAllFilterOn() then
+		local buckets  = {}
+		for _, r in ipairs(RARITY_PRIORITY) do buckets[r] = {} end
+		local noRarity = {}
+
+		for _, m in ipairs(raw) do
+			local r = m:GetAttribute("Rarity")
+			if r and buckets[r] then
+				table.insert(buckets[r], m)
+			else
+				table.insert(noRarity, m)
+			end
+		end
+
+		for _, r in ipairs(RARITY_PRIORITY) do
+			for _, m in ipairs(buckets[r]) do
+				table.insert(list, m)
+			end
+		end
+		for _, m in ipairs(noRarity) do
+			table.insert(list, m)
+		end
+	else
+		for _, m in ipairs(raw) do
+			local r = m:GetAttribute("Rarity")
+			if r == nil or RARITY_FILTER[r] then
+				table.insert(list, m)
+			end
+		end
+	end
+
+	local slots = freeSlots()
+	if slots < #list then
+		local trimmed = {}
+		for i = 1, slots do trimmed[i] = list[i] end
+		list = trimmed
+	end
+
+	return list
+end
+
+local function notify(title, content, duration)
+	Rayfield:Notify({
+		Title    = title,
+		Content  = content,
+		Duration = duration or 3,
+		Image    = 4483362458,
+	})
+end
+
+local function doHome()
+	local sz = getSafeZone()
+	if not sz then notify("❌ Error","SafeZone not found!") return false end
+	waitChar()
+	safeTp(CFrame.new(sz.Position.X, sz.Position.Y + sz.Size.Y/2 + 1, sz.Position.Z))
+	task.wait(0.1)
+	freezeCharacter()
+	return true
+end
+
+local function doCollect()
+	if busy then return false end
+	busy = true
+
+	local list = buildCollectList()
+
+	if #list == 0 then
+		notify("🧲 Collect","No matching loot found.")
+		busy = false
+		return false
+	end
+
+	notify("🧲 Collect","Collecting " .. #list .. " items...")
+	waitChar()
+
+	local collected = 0
+	for _, m in ipairs(list) do
+		if isCarryFull() then
+			notify("🎒 Full","Carry full! Heading home...")
+			break
+		end
+		if not m or not m.Parent then continue end
+		local ok, pv = pcall(function() return m:GetPivot() end)
+		if ok then safeTp(pv + Vector3.new(0,1,0)) end
+		task.wait(TELEPORT_DELAY)
+		collected += 1
+	end
+
+	if not isCarryFull() then
+		task.wait(0.3)
+		local remaining = buildCollectList()
+		if #remaining > 0 then
+			for _, m in ipairs(remaining) do
+				if isCarryFull() then break end
+				if not m or not m.Parent then continue end
+				local ok, pv = pcall(function() return m:GetPivot() end)
+				if ok then safeTp(pv + Vector3.new(0,1,0)) end
+				task.wait(TELEPORT_DELAY)
+				collected += 1
+			end
+		end
+	end
+
+	notify("🧲 Collect","Collected " .. collected .. " items. Heading home...")
+	busy = false
+
+	task.wait(0.15)
+	doHome()
+	return true
+end
+
+local function doSell()
+	local ok = pcall(function()
+		ReplicatedStorage:WaitForChild("Remotes")
+			:WaitForChild("SellRequest"):FireServer({Mode="SellAll"})
+	end)
+	notify("💰 Sell", ok and "Sold successfully!" or "Sell error!")
+	return ok
+end
+
+local function doEquipStick()
+	pcall(function()
+		ReplicatedStorage:WaitForChild("Remotes")
+			:WaitForChild("HoldSlotRequest"):FireServer(1)
+	end)
+	task.wait(0.8)
+	if hasHeldItem() then return true end
+	pcall(function()
+		ReplicatedStorage:WaitForChild("Remotes")
+			:WaitForChild("HoldSlotRequest"):FireServer(1)
+	end)
+	task.wait(0.8)
+	return hasHeldItem()
+end
+
+local function doSplit()
+	local sz = getSplitZone()
+	if not sz then notify("❌ Error","SplitZone not found!") return false end
+	waitChar()
+	local targetCF = CFrame.new(sz.Position.X, sz.Position.Y + sz.Size.Y/2 + 1, sz.Position.Z)
+	safeTp(targetCF) task.wait(0.3) freezeCharacter() task.wait(0.2)
+	if not hasHeldItem() then
+		if not doEquipStick() then
+			notify("❌ Error","Cannot equip stick!")
+			return false
+		end
+	end
+	safeTp(targetCF) task.wait(0.15) freezeCharacter()
+	local ok = pcall(function()
+		ReplicatedStorage:WaitForChild("Remotes")
+			:WaitForChild("SplitRequest"):FireServer(1, true)
+	end)
+	notify("🪓 Split", ok and "Split done!" or "Split error!")
+	return ok
+end
+
+local function autoFarmLoop()
+	if AUTO_LOOP_RUNNING then return end
+	AUTO_LOOP_RUNNING = true
+	notify("🔄 Auto Farm","Started!")
+
+	while AUTO_FARMING do
+		pcall(detectPlayerPlot)
+
+		doHome() task.wait(0.5)
+		if not AUTO_FARMING then break end
+
+		for attempt = 1, MAX_SPLIT_RETRIES do
+			if not AUTO_FARMING then break end
+			if doSplit() then break end
+			task.wait(0.5)
+		end
+		if not AUTO_FARMING then break end
+
+		local waitTime  = 0
+		local lootFound = false
+		while waitTime < SPLIT_WAIT_TIME and AUTO_FARMING do
+			local ch  = player.Character
+			local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+			if hrp then
+				for _, m in ipairs(lootFolder:GetChildren()) do
+					if m:IsA("Model") and m:GetAttribute("PlotName") == CURRENT_PLOT then
+						local r    = m:GetAttribute("Rarity")
+						local pass = (r == nil) or RARITY_FILTER[r]
+						if pass then
+							lootFound = true
+							break
+						end
+					end
+				end
+			end
+			if lootFound then task.wait(0.6) break end
+			task.wait(0.3)
+			waitTime += 0.3
+		end
+		if not AUTO_FARMING then break end
+		if not lootFound then continue end
+
+		doCollect()
+		task.wait(0.3)
+		if not AUTO_FARMING then break end
+
+		doSell() task.wait(0.3)
+		if not AUTO_FARMING then break end
+
+		local leftover = buildCollectList()
+		if #leftover > 0 then
+			doCollect()
+			task.wait(0.3)
+			doSell()
+			task.wait(0.2)
+		end
+		if not AUTO_FARMING then break end
+
+		task.wait(0.2)
+	end
+
+	notify("🔄 Auto Farm","Stopped.")
+	AUTO_LOOP_RUNNING = false
+end
+
+local Window = Rayfield:CreateWindow({
+	Name            = "⚡ Loot Controller",
+	LoadingTitle    = "Loot Controller",
+	LoadingSubtitle = "Loading...",
+	ConfigurationSaving = { Enabled = false },
+	Discord   = { Enabled = false },
+	KeySystem = false,
+})
+
+local MainTab = Window:CreateTab("⚡ Main", "zap")
+
+MainTab:CreateSection("🌍 Plot Settings")
+
+MainTab:CreateDropdown({
+	Name            = "Island",
+	Options         = ISLANDS,
+	CurrentOption   = {CURRENT_ISLAND},
+	Flag            = "IslandDropdown",
+	MultipleOptions = false,
+	Callback        = function(option)
+		CURRENT_ISLAND = type(option)=="table" and option[1] or option
+	end,
+})
+
+MainTab:CreateDropdown({
+	Name            = "Plot",
+	Options         = PLOTS,
+	CurrentOption   = {CURRENT_PLOT},
+	Flag            = "PlotDropdown",
+	MultipleOptions = false,
+	Callback        = function(option)
+		CURRENT_PLOT = type(option)=="table" and option[1] or option
+	end,
+})
+
+MainTab:CreateButton({
+	Name     = "🔍 Auto Detect My Plot",
+	Callback = function()
+		detectPlayerPlot()
+		notify("🔍 Detect","Island: "..tostring(CURRENT_ISLAND).." / Plot: "..tostring(CURRENT_PLOT))
+	end,
+})
+
+MainTab:CreateSlider({
+	Name         = "Teleport Delay",
+	Range        = {0, 1},
+	Increment    = 0.01,
+	Suffix       = "s",
+	CurrentValue = TELEPORT_DELAY,
+	Flag         = "TeleportDelay",
+	Callback     = function(v) TELEPORT_DELAY = v end,
+})
+
+MainTab:CreateSection("⚙️ Actions")
+
+MainTab:CreateButton({
+	Name     = "🧲 Collect & Home",
+	Callback = function()
+		if AUTO_FARMING then notify("⚠️","Stop Auto Farm first!") return end
+		task.spawn(doCollect)
+	end,
+})
+
+MainTab:CreateButton({
+	Name     = "🏠 Home (SafeZone)",
+	Callback = function()
+		if AUTO_FARMING then notify("⚠️","Stop Auto Farm first!") return end
+		doHome()
+	end,
+})
+
+MainTab:CreateButton({
+	Name     = "🪓 Split",
+	Callback = function()
+		if AUTO_FARMING then notify("⚠️","Stop Auto Farm first!") return end
+		task.spawn(doSplit)
+	end,
+})
+
+MainTab:CreateButton({
+	Name     = "💰 Sell All",
+	Callback = function()
+		if AUTO_FARMING then notify("⚠️","Stop Auto Farm first!") return end
+		doSell()
+	end,
+})
+
+MainTab:CreateSection("🔄 Auto Farm")
+
+MainTab:CreateToggle({
+	Name         = "Auto Farm",
+	CurrentValue = false,
+	Flag         = "AutoFarmToggle",
+	Callback     = function(value)
+		AUTO_FARMING = value
+		if AUTO_FARMING then task.spawn(autoFarmLoop) end
+	end,
+})
+
+MainTab:CreateSlider({
+	Name         = "Split Wait Time",
+	Range        = {3, 30},
+	Increment    = 1,
+	Suffix       = "s",
+	CurrentValue = SPLIT_WAIT_TIME,
+	Flag         = "SplitWaitTime",
+	Callback     = function(v) SPLIT_WAIT_TIME = v end,
+})
+
+MainTab:CreateSlider({
+	Name         = "Max Split Retries",
+	Range        = {1, 10},
+	Increment    = 1,
+	Suffix       = "x",
+	CurrentValue = MAX_SPLIT_RETRIES,
+	Flag         = "MaxSplitRetries",
+	Callback     = function(v) MAX_SPLIT_RETRIES = v end,
+})
+
+local FilterTab = Window:CreateTab("🎯 Filter", "filter")
+
+FilterTab:CreateSection("🎯 Filter by Rarity")
+
+FilterTab:CreateParagraph({
+	Title   = "💡 How it works",
+	Content = "Rarity = Secret > Mythic > Legendary > Rare > UnCommon > Common\n"
+})
+
+FilterTab:CreateButton({
+	Name     = "✔ Enable All Rarities",
+	Callback = function()
+		for _, r in ipairs(RARITY_ORDER) do
+			RARITY_FILTER[r] = true
+			local flag = Rayfield.Flags["Filter_"..r]
+			if flag and flag.Set then
+				pcall(function() flag:Set(true) end)
+			end
+		end
+		notify("🎯 Filter","All rarities enabled!")
+	end,
+})
+
+FilterTab:CreateButton({
+	Name     = "✖ Disable All Rarities",
+	Callback = function()
+		for _, r in ipairs(RARITY_ORDER) do
+			RARITY_FILTER[r] = false
+			local flag = Rayfield.Flags["Filter_"..r]
+			if flag and flag.Set then
+				pcall(function() flag:Set(false) end)
+			end
+		end
+		notify("🎯 Filter","All rarities disabled!")
+	end,
+})
+
+FilterTab:CreateSection("Toggle Rarity")
+
+for _, rarity in ipairs(RARITY_ORDER) do
+	FilterTab:CreateToggle({
+		Name         = rarity,
+		CurrentValue = true,
+		Flag         = "Filter_" .. rarity,
+		Callback     = function(value)
+			RARITY_FILTER[rarity] = value
+			notify("🎯 Filter", rarity .. " → " .. (value and "ON ✔" or "OFF ✖"), 2)
+		end,
+	})
+end
+
+local KeybindTab = Window:CreateTab("⌨️ Keybinds", "keyboard")
+KeybindTab:CreateSection("⌨️ Keybinds")
+
+local keybindDefs = {
+	{ name="Collect & Home",   flag="Bind_Collect",  key="G", bind="Collect"  },
+	{ name="Home (SafeZone)",  flag="Bind_Home",     key="F", bind="Home"     },
+	{ name="Split",            flag="Bind_Split",    key="H", bind="Split"    },
+	{ name="Auto Farm Toggle", flag="Bind_AutoFarm", key="J", bind="AutoFarm" },
+	{ name="Sell All",         flag="Bind_SellAll",  key="K", bind="SellAll"  },
+}
+
+for _, def in ipairs(keybindDefs) do
+	KeybindTab:CreateKeybind({
+		Name            = def.name,
+		CurrentKeybind  = def.key,
+		HoldToInteract  = false,
+		Flag            = def.flag,
+		Callback        = function(keybind)
+			BINDS[def.bind] = Enum.KeyCode[keybind] or BINDS[def.bind]
+		end,
+	})
+end
+
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if not input.KeyCode or input.KeyCode == Enum.KeyCode.Unknown then return end
+
+	if input.KeyCode == BINDS.AutoFarm then
+		AUTO_FARMING = not AUTO_FARMING
+		if Rayfield.Flags["AutoFarmToggle"] then
+			Rayfield.Flags["AutoFarmToggle"]:Set(AUTO_FARMING)
+		end
+		if AUTO_FARMING then task.spawn(autoFarmLoop) end
+		return
+	end
+
+	if AUTO_FARMING then return end
+
+	if     input.KeyCode == BINDS.Collect then task.spawn(doCollect)
+	elseif input.KeyCode == BINDS.Home    then doHome()
+	elseif input.KeyCode == BINDS.Split   then task.spawn(doSplit)
+	elseif input.KeyCode == BINDS.SellAll then doSell()
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(5)
+		pcall(detectPlayerPlot)
+	end
+end)
+
+task.wait(1)
+detectPlayerPlot()
+notify("⚡ Loot Controller",
+	"Loaded! " .. tostring(CURRENT_ISLAND) .. " / " .. tostring(CURRENT_PLOT), 4)
